@@ -69,7 +69,9 @@ class TaskAlignedAssigner(nn.Module):
         eps (float): A small value to prevent division by zero.
     """
 
-    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
+    # 突破瓶颈：对于 P2 头产生的大量 Anchor，默认的 topk=10/13 太小了，
+    # 导致很多有效的小目标 Anchor 被当作背景过滤掉。我们将 topk 扩大到 25，增加正样本的召回。
+    def __init__(self, topk=25, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters."""
         super().__init__()
         self.topk = topk

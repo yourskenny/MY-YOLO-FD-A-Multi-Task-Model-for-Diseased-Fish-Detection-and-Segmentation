@@ -35,7 +35,7 @@ class YOLOTrainerGUI:
         
         # Pre-weights
         ttk.Label(frame_basic, text="预训练权重 (pre_weights):").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.var_weights = tk.StringVar(value=r'runs\detect\train12\weights\best.pt')
+        self.var_weights = tk.StringVar(value=r'yolo-fd.pt')
         ttk.Entry(frame_basic, textvariable=self.var_weights, width=40).grid(row=2, column=1, sticky=tk.W, pady=2)
         ttk.Button(frame_basic, text="浏览...", command=self.browse_weights).grid(row=2, column=2, padx=5)
         
@@ -150,9 +150,12 @@ def run_train():
         data='{self.var_data.get()}',
         device='{self.var_device.get()}',
         pre_weights=r'{self.var_weights.get()}',
+        pretrained=True,
         freeze=0,
         epochs={self.var_epochs.get()},
         batch={self.var_batch.get()},
+        imgsz=800,
+        workers=4,
         mtl={self.var_mtl.get()},
         pcgrad={self.var_pcgrad.get()},
         cagrad=False,
@@ -171,6 +174,10 @@ def run_train():
     
     for attempt in range(max_retries):
         try:
+            # 解决 Windows 下多进程 DataLoader 死锁问题
+            import os
+            os.environ['PIN_MEMORY'] = 'False'
+            
             trainer = DetectionTrainer(overrides=args)
             trainer.train()
             print("[INFO] Training completed successfully!")

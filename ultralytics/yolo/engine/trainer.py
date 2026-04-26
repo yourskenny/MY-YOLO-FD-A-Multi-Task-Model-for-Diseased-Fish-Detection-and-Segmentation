@@ -372,20 +372,20 @@ class BaseTrainer:
 
                 with torch.cuda.amp.autocast(self.amp):
                     batch = self.preprocess_batch(batch)  # img / 255 to device
-                    pred = self.model(batch['img'])
+                    pred = self.model(batch['img'])  # forward once
+                    
+                    # Compute detection loss
                     self.loss, self.loss_items = self.model.loss(batch, pred[0])
-
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None \
                         else self.loss_items
-
-                # Forward
-                with torch.cuda.amp.autocast(self.amp):
-                    pred = self.model(batch['img'])  # forward
+                        
+                    # Compute segmentation loss using the same prediction output
                     self.segloss = self.model.SegLoss(pred[1], batch['seg_label']).mean()  # loss scaled by batch_size
                     self.tseg_loss = (self.tseg_loss * i + self.segloss) / (i + 1) if self.tseg_loss is not None \
                         else self.segloss
+
                 if self.args.mtl is None or self.args.mtl < 0:
                     # Backward
                     self.scaler.scale(self.segloss).backward()
@@ -399,15 +399,21 @@ class BaseTrainer:
 
                 # method 1 利用任务之间的不确定性来动态更新权重
                 if self.args.mtl == 1 and not self.args.pcgrad and not self.args.cagrad:
-                    loss_all = self.loss / (2 * self.sigma1) + self.segloss / (self.sigma2) + \
-                               torch.log(torch.sqrt(self.sigma1)) + torch.log(torch.sqrt(self.sigma2))
+                    # 添加 clamp 限制 sigma 发散，防止检测或分割任务被完全抛弃
+                    sigma1_clamped = torch.clamp(self.sigma1, min=0.1, max=5.0)
+                    sigma2_clamped = torch.clamp(self.sigma2, min=0.1, max=5.0)
+                    # 增加 EPS 避免 log(0) 或除 0，并使用 clamp 确保不会产生 NaN
+                    loss_all = self.loss / (2 * sigma1_clamped) + self.segloss / sigma2_clamped + \
+                               torch.log(torch.clamp(torch.sqrt(sigma1_clamped), min=1e-6)) + torch.log(torch.clamp(torch.sqrt(sigma2_clamped), min=1e-6))
                     self.scaler.scale(loss_all).backward()
 
                 # method 4 pcgrad + uncert. or cagrad + uncert.
                 if (self.args.pcgrad or self.args.cagrad) and self.args.mtl == 1:
+                    sigma1_clamped = torch.clamp(self.sigma1, min=0.1, max=5.0)
+                    sigma2_clamped = torch.clamp(self.sigma2, min=0.1, max=5.0)
                     self.optimizer_pcgrad.pc_backward(
-                        [self.loss / (2 * self.sigma1) + torch.log(torch.sqrt(self.sigma1)),
-                         self.segloss / (self.sigma2) + torch.log(torch.sqrt(self.sigma2))])
+                        [self.loss / (2 * sigma1_clamped) + torch.log(torch.clamp(torch.sqrt(sigma1_clamped), min=1e-6)),
+                         self.segloss / sigma2_clamped + torch.log(torch.clamp(torch.sqrt(sigma2_clamped), min=1e-6))])
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
@@ -565,8 +571,11 @@ class BaseTrainer:
             if self.args.pre_weights is None:
                 LOGGER.info("pre_weights (eg,yolov8s.pt) is None,Train without loading any training weights")
             else:
+                # 预训练权重加载：即使由于 P2/Ctxt 引入导致模型结构变化，
+                # 下层 get_model() 也会通过 intersect_dicts 与 strict=False 机制
+                # 安全继承旧的 Backbone 等不变权重，并自动抛弃不匹配的层
                 weights = torch.load(self.args.pre_weights, weights_only=False)
-                LOGGER.info("Train with loading pre training weights")
+                LOGGER.info(f"Train with loading pre training weights from {self.args.pre_weights} (strict=False fallback)")
         self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
         return ckpt
 
@@ -605,12 +614,6 @@ class BaseTrainer:
         """Returns a NotImplementedError when the get_validator function is called."""
         raise NotImplementedError('get_validator function not implemented in trainer')
 
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
-        """
-        Returns dataloader derived from torch.data.Dataloader.
-        """
-        raise NotImplementedError('get_dataloader function not implemented in trainer')
-
     def get_seg_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
         """
         Returns dataloader derived from torch.data.Dataloader.
@@ -618,8 +621,32 @@ class BaseTrainer:
         raise NotImplementedError('get_dataloader function not implemented in trainer')
 
     def build_dataset(self, img_path, mode='train', batch=None):
-        """Build dataset"""
-        raise NotImplementedError('build_dataset function not implemented in trainer')
+        """Build YOLO Dataset
+
+        args:
+            img_path (str): Path to the folder containing images.
+            mode (str): `train` mode or `val` mode, users are able to customize different augmentations for each mode.
+            batch (int, optional): Size of batches, this is for `rect`. Defaults to None.
+        """
+        gs = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+        return build_yolo_dataset(self.args, img_path, batch, self.data, mode=mode, rect=mode == 'val', stride=gs)
+
+    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode='train'):
+        """Construct and return dataloader."""
+        assert mode in ['train', 'val']
+        with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
+            dataset = self.build_dataset(dataset_path, mode, batch_size)
+        shuffle = mode == 'train'
+        if getattr(dataset, 'rect', False) and shuffle:
+            LOGGER.warning("WARNING ⚠️ 'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
+            shuffle = False
+        workers = self.args.workers if mode == 'train' else self.args.workers * 2
+        
+        # 强制在 DataLoader 中关闭 pin_memory 以彻底解决 Windows 下 workers > 0 时卡死在 0% 的问题
+        import os
+        pin_memory = False if os.environ.get('PIN_MEMORY', 'False') == 'False' else self.args.pin_memory
+        
+        return build_dataloader(dataset, batch_size, workers, shuffle, rank, pin_memory=pin_memory)
 
     def label_loss_items(self, loss_items=None, prefix='train'):
         """

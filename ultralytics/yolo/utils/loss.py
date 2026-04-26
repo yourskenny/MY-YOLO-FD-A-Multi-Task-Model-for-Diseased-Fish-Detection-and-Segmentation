@@ -92,19 +92,90 @@ class VarifocalLoss(nn.Module):
         return loss
 
 
+def nwd_loss(pred_bboxes, target_bboxes, eps=1e-6):
+    """
+    计算 Normalized Gaussian Wasserstein Distance (NWD) 损失
+    参考论文: A Normalized Gaussian Wasserstein Distance for Tiny Object Detection
+    将边界框(cx, cy, w, h)建模为二维高斯分布 N(mu, Sigma)，计算其 Wasserstein 距离。
+    """
+    # 将 xyxy 转换为 cx, cy, w, h
+    pred_cx = (pred_bboxes[:, 0] + pred_bboxes[:, 2]) / 2
+    pred_cy = (pred_bboxes[:, 1] + pred_bboxes[:, 3]) / 2
+    pred_w = pred_bboxes[:, 2] - pred_bboxes[:, 0]
+    pred_h = pred_bboxes[:, 3] - pred_bboxes[:, 1]
+
+    target_cx = (target_bboxes[:, 0] + target_bboxes[:, 2]) / 2
+    target_cy = (target_bboxes[:, 1] + target_bboxes[:, 3]) / 2
+    target_w = target_bboxes[:, 2] - target_bboxes[:, 0]
+    target_h = target_bboxes[:, 3] - target_bboxes[:, 1]
+
+    # Wasserstein distance
+    # W^2 = ||mu1 - mu2||_2^2 + Tr(Sigma1 + Sigma2 - 2*(Sigma1^1/2 * Sigma2 * Sigma1^1/2)^1/2)
+    # 对于轴对齐的框，Sigma 是对角的，简化为：
+    # W^2 = (cx1-cx2)^2 + (cy1-cy2)^2 + ((w1-w2)^2 + (h1-h2)^2)/4
+    
+    center_dist = (pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2
+    wh_dist = ((pred_w - target_w) ** 2 + (pred_h - target_h) ** 2) / 4.0
+    
+    wasserstein_sq = center_dist + wh_dist
+    
+    # 经验常数 C，用于归一化，通常与数据集或特征图尺寸相关，这里使用一个相对通用的尺度因子
+    # 论文中推荐 C 为数据集平均绝对面积或设为一个常数
+    # 为了稳定，我们在分母加上 12.8（这是一个经验缩放值）
+    C = 12.8
+    
+    nwd = torch.exp(-torch.sqrt(wasserstein_sq.clamp(min=0.0) + eps) / C)
+    return 1 - nwd
+
+
 class BboxLoss(nn.Module):
 
-    def __init__(self, reg_max, use_dfl=False):
+    def __init__(self, reg_max, use_dfl=False, use_nwd=True):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.reg_max = reg_max
         self.use_dfl = use_dfl
+        self.use_nwd = use_nwd
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
-        """IoU loss."""
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, stride_tensor=None):
+        """IoU loss and NWD loss."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # 融合 NWD 损失 (针对微小目标)
+        if self.use_nwd and pred_bboxes[fg_mask].numel() > 0:
+            # 提取小目标的权重自适应逻辑：面积越小，NWD 的权重越高，面积大则完全依赖 CIoU
+            # 通过 stride_tensor 将尺度恢复到原始图像大小，更准确地判断目标绝对面积
+            target_w = target_bboxes[fg_mask][:, 2] - target_bboxes[fg_mask][:, 0]
+            target_h = target_bboxes[fg_mask][:, 3] - target_bboxes[fg_mask][:, 1]
+            if stride_tensor is not None:
+                # 修复 Mask 维度坍缩与 Batch 广播不匹配报错 (425000 vs 53125)
+                # stride_tensor 通常是单张图片的维度 [1, 53125, 1] 或 [53125, 1]
+                # 而 fg_mask 是整个 Batch 的掩码，例如 [8, 53125] (共 425000 元素)
+                # 所以我们必须先让 stride_tensor 广播（扩展）到和 fg_mask 相同的维度
+                bs = fg_mask.shape[0]  # batch size
+                # expand 扩张到 [batch, 53125]
+                strides_expanded = stride_tensor.squeeze(-1).expand(bs, -1)
+                
+                # 然后再用 fg_mask 去提取有效的目标，此时维度一定能完美对齐
+                strides = strides_expanded[fg_mask]
+                target_w = target_w * strides
+                target_h = target_h * strides
+                
+            target_area = target_w * target_h
+            
+            # 面积归一化因子，假设面积 > 1000 像素（约 31x31）为中大目标，NWD 权重迅速衰减
+            # weight_nwd 范围在 [0, 0.5] 之间平滑过渡
+            weight_nwd = 0.5 * torch.exp(-target_area / 1000.0).unsqueeze(-1)
+            
+            loss_nwd_raw = nwd_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+            loss_nwd = (loss_nwd_raw.unsqueeze(-1) * weight_nwd * weight).sum() / target_scores_sum
+            
+            # 过滤 NaN 或 Inf，防止异常梯度传播导致 CUDA error
+            if not torch.isnan(loss_nwd) and not torch.isinf(loss_nwd):
+                # 动态比例融合 NWD
+                loss_iou = loss_iou + loss_nwd
 
         # DFL loss
         if self.use_dfl:
@@ -232,7 +303,7 @@ class v8DetectionLoss:
         if fg_mask.sum():
             target_bboxes /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores,
-                                              target_scores_sum, fg_mask)
+                                              target_scores_sum, fg_mask, stride_tensor)
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
